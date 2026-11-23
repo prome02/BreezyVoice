@@ -2,9 +2,14 @@
 
 from contextlib import asynccontextmanager
 from io import BytesIO
+import gc
+import hashlib
+import os
+import time
 
+import torch
 import torchaudio
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from g2pw import G2PWConverter
 from pydantic import BaseModel, Field
@@ -39,6 +44,7 @@ class SpeechRequest(BaseModel):
         description="The content that will be synthesized into speech. You can include phonetic symbols if needed, though they should be used sparingly.",
         examples=["今天天氣真好"],
     )
+    input_file: str = ""
     response_format: str = ""
     speed: float = 1.0
 
@@ -46,6 +52,10 @@ class SpeechRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.settings = Settings()
+    prompt_text_path = os.environ.get("SPEAKER_PROMPT_TEXT_TRANSCRIPTION_FILE")
+    if prompt_text_path:
+        with open(prompt_text_path, "r", encoding="utf-8") as file:
+            app.state.settings.speaker_prompt_text_transcription = file.read().strip()
     app.state.cosyvoice = CustomCosyVoice(app.state.settings.model_path)
     app.state.bopomofo_converter = G2PWConverter()
     app.state.prompt_speech_16k = load_wav(
@@ -76,35 +86,52 @@ async def get_models(request: Request):
 
 @app.post("/audio/speech")
 async def speach_endpoint(request: Request, payload: SpeechRequest):
-    # normalization
-    speaker_prompt_text_transcription = (
-        request.app.state.cosyvoice.frontend.text_normalize_new(
-            request.app.state.settings.speaker_prompt_text_transcription, split=False
+    input_text = payload.input
+    if payload.input_file:
+        with open(payload.input_file, "r", encoding="utf-8") as file:
+            input_text = file.read().strip()
+    request_id = hashlib.sha1(input_text.encode("utf-8")).hexdigest()[:10]
+    preview = input_text[:80].replace("\n", " ")
+    start = time.time()
+    print(
+        f"[speech:{request_id}] start chars={len(input_text)} input_file={payload.input_file!r} text={preview!r}",
+        flush=True,
+    )
+    try:
+        output = request.app.state.cosyvoice.inference_zero_shot(
+            input_text,
+            request.app.state.settings.speaker_prompt_text_transcription,
+            request.app.state.prompt_speech_16k,
         )
-    )
-    content_to_synthesize = request.app.state.cosyvoice.frontend.text_normalize_new(
-        payload.input, split=False
-    )
-    speaker_prompt_text_transcription_bopomo = get_bopomofo_rare(
-        speaker_prompt_text_transcription, request.app.state.bopomofo_converter
-    )
-
-    content_to_synthesize_bopomo = get_bopomofo_rare(
-        content_to_synthesize, request.app.state.bopomofo_converter
-    )
-    output = request.app.state.cosyvoice.inference_zero_shot_no_normalize(
-        content_to_synthesize_bopomo,
-        speaker_prompt_text_transcription_bopomo,
-        request.app.state.prompt_speech_16k,
-    )
-    audio_buffer = BytesIO()
-    torchaudio.save(audio_buffer, output["tts_speech"], 22050, format="wav")
-    audio_buffer.seek(0)
-    return StreamingResponse(
-        audio_buffer,
-        media_type="audio/wav",
-        headers={"Content-Disposition": "attachment; filename=output.wav"},
-    )
+        elapsed = time.time() - start
+        print(f"[speech:{request_id}] inference_done sec={elapsed:.2f}", flush=True)
+        audio_buffer = BytesIO()
+        torchaudio.save(audio_buffer, output["tts_speech"], 22050, format="wav")
+        print(f"[speech:{request_id}] wav_ready bytes={audio_buffer.getbuffer().nbytes}", flush=True)
+        audio_buffer.seek(0)
+        return StreamingResponse(
+            audio_buffer,
+            media_type="audio/wav",
+            headers={"Content-Disposition": "attachment; filename=output.wav"},
+        )
+    except Exception as exc:
+        elapsed = time.time() - start
+        print(
+            f"[speech:{request_id}] error sec={elapsed:.2f} type={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+    finally:
+        gc.collect()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            except Exception as cleanup_exc:
+                print(
+                    f"[speech:{request_id}] cuda_cleanup_error type={type(cleanup_exc).__name__}: {cleanup_exc}",
+                    flush=True,
+                )
 
 
 if __name__ == "__main__":
