@@ -32,6 +32,10 @@ class Settings(BaseSettings):
         default="./data/example.wav",
         description="Specifies the path to the prompt speech audio file of the speaker.",
     )
+    llm_fp16: bool = Field(
+        default=False,
+        description="Run the LLM stage under CUDA fp16 autocast (~15% faster, audio not bit-identical). Env: LLM_FP16=1.",
+    )
     speaker_prompt_text_transcription: str = Field(
         default="在密碼學中，加密是將明文資訊改變為難以讀取的密文內容，使之不可讀的方法。只有擁有解密方法的對象，經由解密過程，才能將密文還原為正常可讀的內容。",
         description="Specifies the transcription of the speaker prompt audio.",
@@ -61,6 +65,13 @@ async def lifespan(app: FastAPI):
     app.state.prompt_speech_16k = load_wav(
         app.state.settings.speaker_prompt_audio_path, 16000
     )
+    # The speaker prompt never changes while the server runs, so analyse it once
+    # instead of once per sentence (saves ~1.4 s of CPU work per request).
+    app.state.prompt_cache = app.state.cosyvoice.build_prompt_cache(
+        app.state.settings.speaker_prompt_text_transcription,
+        app.state.prompt_speech_16k,
+    )
+    print(f"[startup] prompt cached, llm_fp16={app.state.settings.llm_fp16}", flush=True)
     yield
     del app.state.cosyvoice
     del app.state.bopomofo_converter
@@ -98,10 +109,10 @@ async def speach_endpoint(request: Request, payload: SpeechRequest):
         flush=True,
     )
     try:
-        output = request.app.state.cosyvoice.inference_zero_shot(
+        output = request.app.state.cosyvoice.inference_zero_shot_cached(
             input_text,
-            request.app.state.settings.speaker_prompt_text_transcription,
-            request.app.state.prompt_speech_16k,
+            request.app.state.prompt_cache,
+            llm_fp16=request.app.state.settings.llm_fp16,
         )
         elapsed = time.time() - start
         print(f"[speech:{request_id}] inference_done sec={elapsed:.2f}", flush=True)
